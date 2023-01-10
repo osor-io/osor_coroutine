@@ -62,16 +62,22 @@ Coroutine :: struct
     procedure : #type ();
     user_data : *void;
     stack_allocation : []u8;
+    owns_stack := false;
     done := false;
 
     #if ASSERT thread_index : u32;
 }
 
-init :: (coroutine : *Coroutine, procedure : #type (), user_data : *void = null, requested_stack_size := 64*1024)
+init :: (coroutine : *Coroutine, procedure : #type (), user_data : *void = null, stack_memory : []u8 = .[], requested_stack_size := 64*1024)
 {
     <<coroutine = Coroutine.{}; 
     coroutine.procedure = procedure;
     coroutine.user_data = user_data;
+    if stack_memory
+    {
+        coroutine.owns_stack = false;
+        coroutine.stack_allocation = stack_memory;
+    }
     #if ASSERT coroutine.thread_index = context.thread_index;
     platform_init(coroutine, requested_stack_size);
 }
@@ -193,25 +199,38 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
 
     platform_init :: (coroutine : *Coroutine, requested_stack_size : int)
     {
-        // Allocate memory for the stack and set up a guard page at the beginning and end of it
-        siSysInfo : Windows.SYSTEM_INFO;
-        Windows.GetNativeSystemInfo(*siSysInfo);
-        page_size : int = ifx siSysInfo.dwPageSize > 16 then siSysInfo.dwPageSize else 16;
-        coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
-        coroutine.stack_allocation.data = Windows.VirtualAlloc(null, cast(u64) coroutine.stack_allocation.count, Windows.MEM_RESERVE | Windows.MEM_COMMIT, Windows.PAGE_READWRITE);
-        assert(coroutine.stack_allocation.data != null);
-        #if GUARD_PAGES 
+        // Setup the stack's top (highest address) and bottom (lowest address)
+        stack_bottom : *u8;
+        stack_top    : *u8;
+        if coroutine.stack_allocation
         {
-            dummy : u32 = 0;
-            protect_result_bottom_page := Windows.VirtualProtect(coroutine.stack_allocation.data,                                                cast(u64)page_size, Windows.PAGE_GUARD | Windows.PAGE_READWRITE, *dummy);
-            protect_result_top_page    := Windows.VirtualProtect(coroutine.stack_allocation.data + coroutine.stack_allocation.count - page_size, cast(u64)page_size, Windows.PAGE_GUARD | Windows.PAGE_READWRITE, *dummy);
-            assert(protect_result_bottom_page != 0);
-            assert(protect_result_top_page    != 0);
+            stack_bottom = coroutine.stack_allocation.data;
+            stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count;
         }
+        else
+        {
+            // Allocate memory for the stack and set up a guard page at the beginning and end of it
+            siSysInfo : Windows.SYSTEM_INFO;
+            Windows.GetNativeSystemInfo(*siSysInfo);
+            page_size : int = ifx siSysInfo.dwPageSize > 16 then siSysInfo.dwPageSize else 16;
+            coroutine.owns_stack = true;
+            coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
+            coroutine.stack_allocation.data = Windows.VirtualAlloc(null, cast(u64) coroutine.stack_allocation.count, Windows.MEM_RESERVE | Windows.MEM_COMMIT, Windows.PAGE_READWRITE);
+            assert(coroutine.stack_allocation.data != null);
+            #if GUARD_PAGES
+            {
+                dummy : u32 = 0;
+                protect_result_bottom_page := Windows.VirtualProtect(coroutine.stack_allocation.data,                                                cast(u64)page_size, Windows.PAGE_GUARD | Windows.PAGE_READWRITE, *dummy);
+                protect_result_top_page    := Windows.VirtualProtect(coroutine.stack_allocation.data + coroutine.stack_allocation.count - page_size, cast(u64)page_size, Windows.PAGE_GUARD | Windows.PAGE_READWRITE, *dummy);
+                assert(protect_result_bottom_page != 0);
+                assert(protect_result_top_page    != 0);
+            }
 
-        // Put the stack in between the two guard pages 
-        stack_bottom := coroutine.stack_allocation.data                                    + (ifx GUARD_PAGES then page_size else 0);
-        stack_top    := coroutine.stack_allocation.data + coroutine.stack_allocation.count - (ifx GUARD_PAGES then page_size else 0);
+            // Put the stack in between the two guard pages 
+            stack_bottom = coroutine.stack_allocation.data                                    + (ifx GUARD_PAGES then page_size else 0);
+            stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count - (ifx GUARD_PAGES then page_size else 0);
+
+        }
         stack_bottom = (stack_bottom + 15) & ~15;
         stack_top    = (stack_top    + 15) & ~15;
         
@@ -276,7 +295,10 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
 
     platform_deinit :: (coroutine : *Coroutine)
     {
-        Windows.VirtualFree(coroutine.stack_allocation.data, 0, Windows.MEM_RELEASE);
+        if coroutine.owns_stack
+        {
+            Windows.VirtualFree(coroutine.stack_allocation.data, 0, Windows.MEM_RELEASE);
+        }
     }
 
     platform_switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context) #c_call
@@ -464,24 +486,36 @@ else #if OS == .MACOS || OS == .LINUX
 
     platform_init :: (coroutine : *Coroutine, requested_stack_size : int)
     {
-        // Allocate memory for the stack and set up a guard page at the beginning and end of it
-        posix_page_size : int = POSIX.sysconf(POSIX._SC_PAGE_SIZE);
-        page_size := ifx posix_page_size > 16 then posix_page_size else 16;
-        coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
-        MAP_STACK :: 0x20000;
-        coroutine.stack_allocation.data = POSIX.mmap(null, cast(u64) coroutine.stack_allocation.count, prot = POSIX.PROT_READ | POSIX.PROT_WRITE, flags = POSIX.MAP_PRIVATE | POSIX.MAP_ANONYMOUS | MAP_STACK, fildes = -1, offset = 0);
-        assert(coroutine.stack_allocation.data != null && coroutine.stack_allocation.data != cast(*void)-1);
-        #if GUARD_PAGES
+        // Setup the stack's top (highest address) and bottom (lowest address)
+        stack_bottom : *u8;
+        stack_top    : *u8;
+        if coroutine.stack_allocation
         {
-            protect_result_bottom_page := POSIX.mprotect(coroutine.stack_allocation.data,                                                cast(u64)page_size, POSIX.PROT_NONE);
-            protect_result_top_page    := POSIX.mprotect(coroutine.stack_allocation.data + coroutine.stack_allocation.count - page_size, cast(u64)page_size, POSIX.PROT_NONE);
-            assert(protect_result_bottom_page == 0);
-            assert(protect_result_top_page    == 0);
+            stack_bottom = coroutine.stack_allocation.data;
+            stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count;
         }
+        else
+        {
+            // Allocate memory for the stack and set up a guard page at the beginning and end of it
+            posix_page_size : int = POSIX.sysconf(POSIX._SC_PAGE_SIZE);
+            page_size := ifx posix_page_size > 16 then posix_page_size else 16;
+            coroutine.owns_stack = true;
+            coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
+            MAP_STACK :: 0x20000;
+            coroutine.stack_allocation.data = POSIX.mmap(null, cast(u64) coroutine.stack_allocation.count, prot = POSIX.PROT_READ | POSIX.PROT_WRITE, flags = POSIX.MAP_PRIVATE | POSIX.MAP_ANONYMOUS | MAP_STACK, fildes = -1, offset = 0);
+            assert(coroutine.stack_allocation.data != null && coroutine.stack_allocation.data != cast(*void)-1);
+            #if GUARD_PAGES
+            {
+                protect_result_bottom_page := POSIX.mprotect(coroutine.stack_allocation.data,                                                cast(u64)page_size, POSIX.PROT_NONE);
+                protect_result_top_page    := POSIX.mprotect(coroutine.stack_allocation.data + coroutine.stack_allocation.count - page_size, cast(u64)page_size, POSIX.PROT_NONE);
+                assert(protect_result_bottom_page == 0);
+                assert(protect_result_top_page    == 0);
+            }
 
-        // Put the stack in between the two guard pages 
-        stack_bottom := coroutine.stack_allocation.data                                    + (ifx GUARD_PAGES then page_size else 0);
-        stack_top    := coroutine.stack_allocation.data + coroutine.stack_allocation.count - (ifx GUARD_PAGES then page_size else 0);
+            // Put the stack in between the two guard pages 
+            stack_bottom = coroutine.stack_allocation.data                                    + (ifx GUARD_PAGES then page_size else 0);
+            stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count - (ifx GUARD_PAGES then page_size else 0);
+        }
         stack_bottom = (stack_bottom + 15) & ~15;
         stack_top    = (stack_top    + 15) & ~15;
 
@@ -540,8 +574,11 @@ else #if OS == .MACOS || OS == .LINUX
 
     platform_deinit :: (coroutine : *Coroutine)
     {
-        unmap_result := POSIX.munmap(coroutine.stack_allocation.data, xx coroutine.stack_allocation.count);
-        assert(unmap_result == 0);
+        if coroutine.owns_stack
+        {
+            unmap_result := POSIX.munmap(coroutine.stack_allocation.data, xx coroutine.stack_allocation.count);
+            assert(unmap_result == 0);
+        }
     }
 
     platform_switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context) #c_call

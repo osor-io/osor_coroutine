@@ -10,6 +10,7 @@ main :: ()
     fibonacci_in_u64();
     roguelike_room();
     text_adventure_conversation();
+    custom_stack_memory();
 }
 
 
@@ -261,6 +262,45 @@ text_adventure_conversation :: ()
     init(*coroutine, conversation);
     defer deinit(*coroutine);
 
+    while !is_done(*coroutine)
+    {
+        run(*coroutine);
+    }
+}
+
+
+
+custom_stack_memory :: ()
+{
+    print_example_name("Using the provided memory for the stack");
+
+    the_coroutine :: ()
+    {
+        a := 1;
+        b := 2.0;
+        c := true;
+        print("A, B, C, D = %(%), %(%), %(%)\n", a,*a, b,*b, c,*c);
+        yield();
+        a += 1;
+        b += 1;
+        c ^= true;
+        print("A, B, C, D = %(%), %(%), %(%)\n", a,*a, b,*b, c,*c);
+        yield();
+        a *= 2;
+        b *= 2;
+        c |= true;
+        print("A, B, C, D = %(%), %(%), %(%)\n", a,*a, b,*b, c,*c);
+    }
+
+    buffer : []u8;
+    buffer.count = 32 * 1024;
+    buffer.data  = alloc(buffer.count); 
+    defer free(buffer.data);
+    print("My stack memory goes from % to %\n", buffer.data, buffer.data + buffer.count);
+
+    coroutine : Coroutine;
+    init(*coroutine, procedure = the_coroutine, stack_memory = buffer);
+    defer deinit(*coroutine);
     while !is_done(*coroutine)
     {
         run(*coroutine);
