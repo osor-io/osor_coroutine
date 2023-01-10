@@ -1,6 +1,6 @@
 # :running: Coroutine
 
-A coroutine module for the Jai programming language. You can check the code in (module.jai)[module.jai] then a few examples of how to use them in [example.jai](example.jai)
+A coroutine module for the Jai programming language. You can check the code in [module.jai](module.jai) then a few examples of how to use them in [example.jai](example.jai)
 
 ## Notes
 
