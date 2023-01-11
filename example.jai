@@ -7,6 +7,7 @@
 main :: ()
 {
     simple_coroutine();
+    arguments_and_return_types();
     fibonacci_in_u64();
     roguelike_room();
     text_adventure_conversation();
@@ -20,20 +21,22 @@ simple_coroutine :: ()
     print_example_name("A simple coroutine call");
 
     //
-    // A simple example where we call a coroutine and it executes until the yield() call, then
+    // A simple example where we call a coroutine and it executes until the yield(coroutine) call, then
     // we call it again and it executes until the end. Just to get a test for things. More
     // details on what you can do with this on further examples.
     //
-    our_coroutine :: ()
+    our_coroutine :: (coroutine : *Coroutine(void, void), parameter : void) -> void
     {
         print("[Coroutine] Hello! The coroutine is just starting, I'm lazy so that's all I'm gonna do this time, coming back to the caller\n");
-        yield(); // Here we return to the code that called run() and we continue from here on the next run() call
+        yield(coroutine); // Here we return to the code that called run() and we continue from here on the next run() call
         print("[Coroutine] We have come back to the coroutine, It seems like I'm more than lazy, so I'm finishing now\n");
-        return;  // You don't need to explicitly return, but just for clarity we'll put it in.
+        dummy : void;
+        return dummy;
     }
 
-    coroutine : Coroutine;
-    init(*coroutine, procedure = our_coroutine);
+    coroutine : Coroutine(Parameter_Type = void, Return_Type = void);
+    dummy : void;
+    init(*coroutine, procedure = our_coroutine, parameter = dummy);
     defer deinit(*coroutine);
 
     print("[Caller] Running coroutine for the first time\n");
@@ -45,11 +48,35 @@ simple_coroutine :: ()
 
 
 
+arguments_and_return_types :: ()
+{
+    print_example_name("Testing arguments and return types");
+
+    the_coroutine :: (coroutine : *Coroutine(int, float), a : int) -> float
+    {
+        f := cast(float)a + 1.5;
+        yield(coroutine, f);
+        f += 1.0;
+        return f;
+    }
+
+    coroutine : Coroutine(int, float);
+    init(*coroutine, procedure = the_coroutine, parameter = 5);
+    defer deinit(*coroutine);
+
+    while !is_done(*coroutine)
+    {
+        print("Corroutine returned %\n", run(*coroutine));
+    }
+}
+
+
+
 fibonacci_in_u64 :: ()
 {
     print_example_name("All the fibonacci numbers until they overflow a u64");
 
-    fibonacci :: ()
+    fibonacci :: (coroutine : *Coroutine(void, void), parameter : void) -> void
     {
         //
         // These two local variables will live on the coroutine's stack now (or in registers)
@@ -71,7 +98,7 @@ fibonacci_in_u64 :: ()
         //
         // So right in this line, we'll jump to the while !is_done() loop in coroutine_example().
         //
-        yield();
+        yield(coroutine);
         //
         // Then when coroutine_example() decides to call run() on us again, we jump back to exactly here, just
         // after the yield();
@@ -88,7 +115,7 @@ fibonacci_in_u64 :: ()
             if (a > 0xffff_ffff_ffff_ffff - b)
             {
                 print("Apparently fibonacci index % overflows a u64! :D\n", it);
-                yield();
+                yield(coroutine);
                 break;
             }
             else
@@ -97,7 +124,7 @@ fibonacci_in_u64 :: ()
                 a = b;
                 b = sum;
                 print("Fibonacci index % is %\n", it, a);
-                yield();
+                yield(coroutine);
             }
         }
         print("And we're done!\n");
@@ -107,10 +134,13 @@ fibonacci_in_u64 :: ()
         // yield manually, the only difference being that this coroutine can't be resumed anymore since it
         // ran out of instructions to run! And from here onwards is_done(coroutine) will return true.
         //
+        dummy : void;
+        return dummy;
     }
 
-    coroutine : Coroutine;
-    init(*coroutine, fibonacci);
+    coroutine : Coroutine(void, void);
+    dummy : void;
+    init(*coroutine, fibonacci, parameter = dummy);
     defer deinit(*coroutine);
     while !is_done(*coroutine)
     {
@@ -133,7 +163,7 @@ roguelike_room :: ()
     {
         monsters := 0;
     };
-    room_with_monsters :: ()
+    room_with_monsters :: (coroutine : *Coroutine(*Room, void), room : *Room) -> void
     {
         //
         // Something that might not be immediately obvious is that when you call yield() you
@@ -143,7 +173,7 @@ roguelike_room :: ()
         //     monster_handle := create_monster();
         //     monster_pointer := get_monster_memory(monster_handle);
         //     monster_pointer.name = "Antoine";
-        //     yield();
+        //     yield(coroutine);
         //     monster_pointer.health += 10; // This could be invalid! Check that the handle is still valid and get the pointer again.
         // 
         // After yielding, the player could have killed the monster and the monster could have been
@@ -180,8 +210,6 @@ roguelike_room :: ()
         //     }
         //
 
-        room := cast(*Room)context.current_coroutine.user_data;
-
         // Because we can jump back to our caller at any point maintaining out
         // local state, we can do stuff like this that would need to wait for a
         // certain time, but letting the caller resume with processing. In this case
@@ -199,14 +227,17 @@ roguelike_room :: ()
         // return back to the caller. Whenever the monsters are all dead, the loop will
         // end and continue the coroutine.
         print("Waiting for the player to kill all monsters\n");
-        while room.monsters > 0 yield();
+        while room.monsters > 0 yield(coroutine);
 
         print("The player killed all the monsters uh? Open the door!\n");
+
+        dummy : void;
+        return dummy;
     }
 
     room : Room;
-    coroutine : Coroutine;
-    init(*coroutine, room_with_monsters, user_data = *room);
+    coroutine : Coroutine(*Room, void);
+    init(*coroutine, room_with_monsters, parameter = *room);
     defer deinit(*coroutine);
 
     // This would be the game loop, running the coroutine once per frame.
@@ -232,7 +263,7 @@ text_adventure_conversation :: ()
 {
     print_example_name("A conversation in some text adventure game");
 
-    conversation :: ()
+    conversation :: (coroutine : *Coroutine(void, void), parameter : void) -> void
     {
         present_text("Hello adventurer!\n");
         wait_for(1.0);
@@ -256,10 +287,13 @@ text_adventure_conversation :: ()
             }
         }
         present_text("Now be on your way!");
+        dummy : void;
+        return dummy;
     }
 
-    coroutine : Coroutine;
-    init(*coroutine, conversation);
+    coroutine : Coroutine(void, void);
+    dummy : void;
+    init(*coroutine, conversation, parameter = dummy);
     defer deinit(*coroutine);
 
     while !is_done(*coroutine)
@@ -274,22 +308,24 @@ custom_stack_memory :: ()
 {
     print_example_name("Using the provided memory for the stack");
 
-    the_coroutine :: ()
+    the_coroutine :: (coroutine : *Coroutine(void, void), parameter : void) -> void
     {
         a := 1;
         b := 2.0;
         c := true;
         print("A, B, C, D = %(%), %(%), %(%)\n", a,*a, b,*b, c,*c);
-        yield();
+        yield(coroutine);
         a += 1;
         b += 1;
         c ^= true;
         print("A, B, C, D = %(%), %(%), %(%)\n", a,*a, b,*b, c,*c);
-        yield();
+        yield(coroutine);
         a *= 2;
         b *= 2;
         c |= true;
         print("A, B, C, D = %(%), %(%), %(%)\n", a,*a, b,*b, c,*c);
+        dummy : void;
+        return dummy;
     }
 
     buffer : []u8;
@@ -298,8 +334,9 @@ custom_stack_memory :: ()
     defer free(buffer.data);
     print("My stack memory goes from % to %\n", buffer.data, buffer.data + buffer.count);
 
-    coroutine : Coroutine;
-    init(*coroutine, procedure = the_coroutine, stack_memory = buffer);
+    coroutine : Coroutine(void, void);
+    dummy : void;
+    init(*coroutine, procedure = the_coroutine, parameter = dummy, stack_memory = buffer);
     defer deinit(*coroutine);
     while !is_done(*coroutine)
     {
@@ -319,7 +356,7 @@ custom_stack_memory :: ()
 // times, like your gameplay time (paused in some cases) instead of system time. But wanted
 // to have it here in the example because it's something you might wanna do :)
 //
-wait_for :: (time : float)
+wait_for :: (time : float) #expand
 {
     // Because the non-volatile registers and the stack are maintained, we can
     // save the starting time as a variable and compare it every frame, see if
@@ -327,17 +364,17 @@ wait_for :: (time : float)
     start := no_inline current_time_monotonic();
     while to_float64_seconds(current_time_monotonic() - start) < time 
     {
-        yield();
+        yield(`coroutine);
     }
 }
 
 
 
 //
-// Making use of the wait_for() procedure above, we can simulate text
+// Similar construct as the wait_for() procedure above, we can simulate text
 // getting revealed character by character very easily with a loop.
 //
-present_text :: (text : string)
+present_text :: (text : string) #expand
 {
     DELAYS :: float.[0.6, 0.3, 0.05, 0.02, 0.01];
     current_delay_index := 2;
@@ -353,7 +390,12 @@ present_text :: (text : string)
         char : string;
         char.data  = *text[it];
         char.count = 1;
-        wait_for(DELAYS[clamp(current_delay_index, 0, DELAYS.count-1)]);
+        time := DELAYS[clamp(current_delay_index, 0, DELAYS.count-1)];
+        start := no_inline current_time_monotonic();
+        while to_float64_seconds(current_time_monotonic() - start) < time 
+        {
+            yield(`coroutine);
+        }
         write_string(char);
     }
 }

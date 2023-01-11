@@ -54,25 +54,32 @@ else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location)
 
 
 
-Coroutine :: struct
+Coroutine :: struct (Parameter_Type : Type, Return_Type : Type)
 {
     main_context : Coroutine_Context #align 16;
     back_context : Coroutine_Context #align 16;
 
-    procedure : #type ();
-    user_data : *void;
     stack_allocation : []u8;
     owns_stack := false;
     done := false;
 
+    This_Coroutine_Type :: #this;
+    procedure    : #type (*This_Coroutine_Type, Parameter_Type) -> Return_Type;
+    parameter    : Parameter_Type;
+    return_value : Return_Type;
+    
     #if ASSERT thread_index : u32;
 }
 
-init :: (coroutine : *Coroutine, procedure : #type (), user_data : *void = null, stack_memory : []u8 = .[], requested_stack_size := 64*1024)
+init :: (coroutine : *Coroutine,
+         procedure : type_of(coroutine.procedure),
+         parameter : type_of(coroutine.parameter),
+         stack_memory : []u8 = .[],
+         requested_stack_size := 64*1024)
 {
-    <<coroutine = Coroutine.{}; 
+    <<coroutine = .{}; 
     coroutine.procedure = procedure;
-    coroutine.user_data = user_data;
+    coroutine.parameter = parameter;
     if stack_memory
     {
         coroutine.owns_stack = false;
@@ -87,22 +94,19 @@ deinit :: (coroutine : *Coroutine)
     platform_deinit(coroutine);
 }
 
-#add_context current_coroutine : *Coroutine = null;
-
-run :: (coroutine : *Coroutine)
+run :: (coroutine : *Coroutine) -> coroutine.Return_Type
 {
     #if ASSERT assert(coroutine.thread_index == context.thread_index);
-    caller_coroutine := context.current_coroutine;
-    context.current_coroutine = coroutine;
     switch_context(from = *coroutine.back_context, to = *coroutine.main_context, *context);
-    context.current_coroutine = caller_coroutine;
+    return coroutine.return_value;
 }
 
-yield :: ()
+yield :: (coroutine : *Coroutine) { dummy : void; yield(coroutine, dummy); }
+yield :: (coroutine : *Coroutine, return_value : coroutine.Return_Type)
 {
-    assert(context.current_coroutine != null);
-    #if ASSERT assert(context.current_coroutine.thread_index == context.thread_index);
-    switch_context(from = *context.current_coroutine.main_context, to = *context.current_coroutine.back_context, *context);
+    #if ASSERT assert(coroutine.thread_index == context.thread_index);
+    coroutine.return_value = return_value;
+    switch_context(from = *coroutine.main_context, to = *coroutine.back_context, *context);
 }
 
 is_done :: (coroutine : *Coroutine) -> bool
@@ -140,7 +144,10 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, jai_context : *Context)
     {
         #bytes u8.[0x48, 0x83, 0xe4, 0xf0];
     }
-    push_context jai_context { coroutine.procedure(); }
+    push_context jai_context
+    {
+        coroutine.return_value = coroutine.procedure(coroutine, coroutine.parameter);
+    }
     coroutine.done = true;
     switch_context(from = *coroutine.main_context, to = *coroutine.back_context, jai_context);
 }
@@ -235,11 +242,12 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
         stack_top    = (stack_top    + 15) & ~15;
         
         // Setup the initial state of the registers in the coroutine context
-        coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);         // Address we're going to jump to in the first execution
-        coroutine.main_context.rsp = cast(u64)(stack_top);                     // Stack pointer
-        coroutine.main_context.r12 = cast(u64)cast(*void)(the_coroutine_code); // Address the trampoline will jump to
-        coroutine.main_context.r13 = cast(u64)(coroutine);                     // The pointer to the coroutine data
-        coroutine.main_context.r14 = cast(u64)(*context);                      // The pointer to the current Jai context
+        COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, *context));
+        coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);     // Address we're going to jump to in the first execution
+        coroutine.main_context.rsp = cast(u64)(stack_top);                 // Stack pointer
+        coroutine.main_context.r12 = cast(u64)cast(*void)(COROUTINE_CODE); // Address the trampoline will jump to
+        coroutine.main_context.r13 = cast(u64)(coroutine);                 // The pointer to the coroutine data
+        coroutine.main_context.r14 = cast(u64)(*context);                  // The pointer to the current Jai context
 
         // Setup the initial state of Window's TIB or Thread Information Block stuff: https://en.wikipedia.org/wiki/Win32_Thread_Information_Block
         coroutine.main_context.stack_base    = cast(u64)stack_top;
@@ -520,11 +528,12 @@ else #if OS == .MACOS || OS == .LINUX
         stack_top    = (stack_top    + 15) & ~15;
 
         // Setup the initial state of the registers in the coroutine context
-        coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);         // Address we're going to jump to in the first execution
-        coroutine.main_context.rsp = cast(u64)(stack_top);                     // Stack pointer
-        coroutine.main_context.r12 = cast(u64)cast(*void)(the_coroutine_code); // Address the trampoline will jump to
-        coroutine.main_context.r13 = cast(u64)(coroutine);                     // Coroutine procedure that start will call
-        coroutine.main_context.r14 = cast(u64)(*context);                      // The pointer to the current Jai context
+        COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, *context));
+        coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);     // Address we're going to jump to in the first execution
+        coroutine.main_context.rsp = cast(u64)(stack_top);                 // Stack pointer
+        coroutine.main_context.r12 = cast(u64)cast(*void)(COROUTINE_CODE); // Address the trampoline will jump to
+        coroutine.main_context.r13 = cast(u64)(coroutine);                 // Coroutine procedure that start will call
+        coroutine.main_context.r14 = cast(u64)(*context);                  // The pointer to the current Jai context
 
         // Setup the initial state of some of the floating point math control registers
         {
