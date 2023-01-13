@@ -96,6 +96,7 @@ deinit :: (coroutine : *Coroutine)
 
 run :: (coroutine : *Coroutine) -> coroutine.Return_Type
 {
+    assert(!is_done(coroutine));
     #if ASSERT assert(coroutine.thread_index == context.thread_index);
     switch_context(from = *coroutine.back_context, to = *coroutine.main_context, *context);
     return coroutine.return_value;
