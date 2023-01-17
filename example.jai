@@ -1,4 +1,4 @@
-#import,dir "../Coroutine";
+#import,dir "../osor_coroutine";
 #import "Basic";
 #import "Random";
 
