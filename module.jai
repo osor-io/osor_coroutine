@@ -77,7 +77,7 @@ init :: (coroutine : *Coroutine,
          stack_memory : []u8 = .[],
          requested_stack_size := 64*1024)
 {
-    <<coroutine = .{}; 
+    coroutine.* = .{}; 
     coroutine.procedure = procedure;
     coroutine.parameter = parameter;
     if stack_memory
@@ -243,6 +243,23 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
         stack_top    = (stack_top    + 15) & ~15;
         
         // Setup the initial state of the registers in the coroutine context
+        trampoline :: no_inline () #c_call // Procedure to jump to on the first run of the coroutine
+        {
+            #if ASSEMBLE 
+            {
+                #bytes BYTES;
+                #run print_bytes_array(BYTES);
+                BYTES :: #run x64_to_bytes(#string DONE
+                    mov rcx, r13   # *Coroutine
+                    mov rdx, r14   # *Context
+                    jmp r12        # jumping to the_coroutine_code(*Coroutine, *Context)
+                DONE);
+            }
+            else
+            {
+                #bytes u8.[0x4c, 0x89, 0xe9, 0x4c, 0x89, 0xf2, 0x41, 0xff, 0xe4];
+            }
+        }
         COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, *context));
         coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);     // Address we're going to jump to in the first execution
         coroutine.main_context.rsp = cast(u64)(stack_top);                 // Stack pointer
@@ -279,25 +296,6 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
             else
             {
                 #bytes u8.[0x41, 0xd9, 0x3a];
-            }
-        }
-
-        // Procedure to jump to on the first run of the coroutine
-        trampoline :: no_inline () #c_call
-        {
-            #if ASSEMBLE 
-            {
-                #bytes BYTES;
-                #run print_bytes_array(BYTES);
-                BYTES :: #run x64_to_bytes(#string DONE
-                    mov rcx, r13   # *Coroutine
-                    mov rdx, r14   # *Context
-                    jmp r12        # jumping to the_coroutine_code(*Coroutine, *Context)
-                DONE);
-            }
-            else
-            {
-                #bytes u8.[0x4c, 0x89, 0xe9, 0x4c, 0x89, 0xf2, 0x41, 0xff, 0xe4];
             }
         }
     }
