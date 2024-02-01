@@ -3,7 +3,7 @@
 
 #module_parameters(ASSERT := true, GUARD_PAGES := true);
 #if ASSERT #import "Basic";
-else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {}
+else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
 
 
 
