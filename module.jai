@@ -1,7 +1,7 @@
 
 
 
-#module_parameters(ASSERT := true, GUARD_PAGES := true);
+#module_parameters(ASSERT := true, GUARD_PAGES := true, DEFAULT_STACK_SIZE := 64 * 1024);
 #if ASSERT #import "Basic";
 else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
 
@@ -61,23 +61,36 @@ Coroutine :: struct (Parameter_Type : Type, Return_Type : Type)
 
     stack_allocation : []u8;
     owns_stack := false;
-    done := false;
+    done := true;
 
     This_Coroutine_Type :: #this;
-    procedure    : #type (*This_Coroutine_Type, Parameter_Type) -> Return_Type;
-    parameter    : Parameter_Type;
+    parameter : Parameter_Type;
     return_value : Return_Type;
-    
+
+    #if Parameter_Type == void
+    {
+        #if Return_Type == void then procedure : #type (*This_Coroutine_Type);
+                                else procedure : #type (*This_Coroutine_Type) -> Return_Type;
+    }
+    else
+    {
+        #if Return_Type == void then procedure : #type (*This_Coroutine_Type, Parameter_Type);
+                                else procedure : #type (*This_Coroutine_Type, Parameter_Type) -> Return_Type;
+    }
+
     #if ASSERT thread_index : u32;
 }
+
+
 
 init :: (coroutine : *Coroutine,
          procedure : type_of(coroutine.procedure),
          parameter : type_of(coroutine.parameter),
          stack_memory : []u8 = .[],
-         requested_stack_size := 64*1024)
+         requested_stack_size := DEFAULT_STACK_SIZE)
 {
     coroutine.* = .{}; 
+    coroutine.done = false;
     coroutine.procedure = procedure;
     coroutine.parameter = parameter;
     if stack_memory
@@ -89,9 +102,19 @@ init :: (coroutine : *Coroutine,
     platform_init(coroutine, requested_stack_size);
 }
 
+init :: (coroutine : *Coroutine(void, $R),
+         procedure : type_of(coroutine.procedure),
+         stack_memory : []u8 = .[],
+         requested_stack_size := DEFAULT_STACK_SIZE)
+{
+    dummy : void;
+    init(coroutine, procedure, dummy, stack_memory, requested_stack_size);
+}
+
 deinit :: (coroutine : *Coroutine)
 {
     platform_deinit(coroutine);
+    coroutine.* = .{}; 
 }
 
 run :: (coroutine : *Coroutine) -> coroutine.Return_Type
@@ -147,7 +170,18 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, jai_context : *Context)
     }
     push_context jai_context
     {
-        coroutine.return_value = coroutine.procedure(coroutine, coroutine.parameter);
+        #if coroutine.Parameter_Type == void
+        {
+            #if coroutine.Return_Type == void then coroutine.procedure(coroutine);
+            else          coroutine.return_value = coroutine.procedure(coroutine);
+        }
+        else
+        {
+            #if coroutine.Return_Type == void then coroutine.procedure(coroutine, coroutine.parameter);
+            else          coroutine.return_value = coroutine.procedure(coroutine, coroutine.parameter);
+        }
+
+
     }
     coroutine.done = true;
     switch_context(from = *coroutine.main_context, to = *coroutine.back_context, jai_context);
