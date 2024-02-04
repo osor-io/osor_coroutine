@@ -89,6 +89,7 @@ init :: (coroutine : *Coroutine,
          stack_memory : []u8 = .[],
          requested_stack_size := DEFAULT_STACK_SIZE)
 {
+    assert(!is_initialized(coroutine));
     coroutine.* = .{}; 
     coroutine.done = false;
     coroutine.procedure = procedure;
@@ -113,16 +114,23 @@ init :: (coroutine : *Coroutine(void, $R),
 
 deinit :: (coroutine : *Coroutine)
 {
-    platform_deinit(coroutine);
-    coroutine.* = .{}; 
+    if is_initialized(coroutine)
+    {
+        platform_deinit(coroutine);
+        coroutine.* = .{}; 
+        assert(!is_initialized(coroutine));
+    }
 }
 
-run :: (coroutine : *Coroutine) -> coroutine.Return_Type
+run :: (coroutine : *Coroutine, deinit_when_is_done := true) -> coroutine.Return_Type
 {
+    assert(is_initialized(coroutine));
     assert(!is_done(coroutine));
     #if ASSERT assert(coroutine.thread_index == context.thread_index);
     switch_context(from = *coroutine.back_context, to = *coroutine.main_context, *context);
-    return coroutine.return_value;
+    return_value := coroutine.return_value;
+    if deinit_when_is_done && is_done(coroutine) then deinit(coroutine);
+    return return_value;
 }
 
 yield :: (coroutine : *Coroutine) { dummy : void; yield(coroutine, dummy); }
@@ -133,9 +141,14 @@ yield :: (coroutine : *Coroutine, return_value : coroutine.Return_Type)
     switch_context(from = *coroutine.main_context, to = *coroutine.back_context, *context);
 }
 
-is_done :: (coroutine : *Coroutine) -> bool
+is_done :: (coroutine : Coroutine) -> bool
 {
     return coroutine.done;
+}
+
+is_initialized :: (coroutine : Coroutine) -> bool
+{
+    return coroutine.procedure != null;
 }
 
 
