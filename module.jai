@@ -1,12 +1,6 @@
 
 
 
-#module_parameters(ASSERT := true, GUARD_PAGES := true, DEFAULT_STACK_SIZE := 64 * 1024);
-#if ASSERT #import "Basic";
-else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
-
-
-
 //
 // This is a simple x64 resumable procedure implementation. Some people call them
 // asymmetric coroutines as well.
@@ -17,133 +11,108 @@ else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location)
 //
 // See example.jai for more details.
 //
-// Some notes about which threads can call these and the context:
-//
-// About the Jai context and threading. This is slightly fiddly to work with and I haven't made a
-// decission about what context should a given coroutine be using. I suppose that ideally it would use
-// whatever context is in the thread the user is calling run() on, but switching (jai) contexts is not easy here
-// and it would require me to know exactly where in the stack and/or which register has the context pointer at
-// any time. At the time of writing this is also subject to change in the language.
-//
-// Right now, the context used on the coroutine is the one from the thread that calls init(), and then the
-// user is expected to always call run() from that same thread. This makes it so we don't have to worry where
-// the context is accessed from when switching to the coroutine, it'll be just a normal register. Although it
-// has the disadvantage that we need to keep some things in check, like context.stack_trace.
-//
-// The other option that also seems sensible is to have each coroutine have its own context. This would probably
-// end up being simpler. Since we don't worry then about stuff like context.stack_trace. And it would even allow
-// us to call the coroutine from different threads in different run() calls. But this is also tricky in some sense.
-// I want this to be a simple implementation and very transparent to the user, if a different context which you can't
-// easily access just happens to appear, this can lead to confusion and bugs. The idea of a "context" in Jai is also
-// quite tied to the current thread, plus what would happen with temporary storage? I don't like the ramifications
-// of having a separate hidden context.
-//
-// I suppose the true best way would be to transparently switch to whatever context the thread that calls run() has, but
-// in the middle of the procedure, when calling yield, the context could be in any register, or somewhere in the stack that
-// we don't know, so unless there's a way to explicitly change the context pointer, we can't have it use the context from any
-// thread. I don't think push_context works in this sense, because it appears scoped and does more complex stuff like some initialization
-// and some changes on the context based on the x64 assembly I'm seeing, so it's not the same as just setting the stack and
-// the appropriate registers. 
-//
-// So yeah, for now a single coroutine is meant to be called from one thread. This is set on the thread that initializes it
-// and we assert that this is being followed. This is because init() reads the context pointer already to set up the beginning
-// of the coroutine so both init() and all the run() calls for a given coroutine need to be on that same thread.
-//
-//                                                                       - Ruben Osorio, 04/01/2023
+//                                            - Ruben Osorio, 04/01/2023
 //
 
 
 
-Coroutine :: struct (Parameter_Type : Type, Return_Type : Type)
+#module_parameters(ASSERT := true, GUARD_PAGES := true, DEFAULT_STACK_SIZE := 64 * 1024, TEMPORARY_STORAGE_SIZE := 4 * 1024, CHECK_STACK_USAGE := false);
+#if ASSERT #import "Basic";
+else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
+
+
+
+Coroutine :: struct (Procedure_Type : Type)
 {
     main_context : Coroutine_Context #align 16;
     back_context : Coroutine_Context #align 16;
 
+    pointer_to_context : *Context;
+
+    stack : []u8;
     stack_allocation : []u8;
-    owns_stack := false;
-    done := true;
 
-    This_Coroutine_Type :: #this;
-    parameter : Parameter_Type;
-    return_value : Return_Type;
-
-    #if Parameter_Type == void
-    {
-        #if Return_Type == void then procedure : #type (*This_Coroutine_Type);
-                                else procedure : #type (*This_Coroutine_Type) -> Return_Type;
-    }
-    else
-    {
-        #if Return_Type == void then procedure : #type (*This_Coroutine_Type, Parameter_Type);
-                                else procedure : #type (*This_Coroutine_Type, Parameter_Type) -> Return_Type;
-    }
-
-    #if ASSERT thread_index : u32;
+    procedure : Procedure_Type;
+    #assert(type_info(Procedure_Type).type == .PROCEDURE);
+    #assert(type_info(Procedure_Type).return_types.count == 0);
+    Packed_Arguments :: #run generate_packed_arguments(Procedure_Type);
 }
-
-
 
 init :: (coroutine : *Coroutine,
          procedure : type_of(coroutine.procedure),
-         parameter : type_of(coroutine.parameter),
-         stack_memory : []u8 = .[],
-         requested_stack_size := DEFAULT_STACK_SIZE)
+         $arguments : ..Code,
+         stack : []u8 = .[],
+         requested_stack_size := DEFAULT_STACK_SIZE) #expand
 {
     assert(!is_initialized(coroutine));
     coroutine.* = .{}; 
-    coroutine.done = false;
     coroutine.procedure = procedure;
-    coroutine.parameter = parameter;
-    if stack_memory
-    {
-        coroutine.owns_stack = false;
-        coroutine.stack_allocation = stack_memory;
-    }
-    #if ASSERT coroutine.thread_index = context.thread_index;
-    platform_init(coroutine, requested_stack_size);
-}
 
-init :: (coroutine : *Coroutine(void, $R),
-         procedure : type_of(coroutine.procedure),
-         stack_memory : []u8 = .[],
-         requested_stack_size := DEFAULT_STACK_SIZE)
-{
-    dummy : void;
-    init(coroutine, procedure, dummy, stack_memory, requested_stack_size);
+    packed_arguments : coroutine.Packed_Arguments;
+    packed_arguments.init_context = *context;
+    #insert -> string
+    {
+        builder : String_Builder;
+        for arguments print(*builder, "packed_arguments.argument_%1 = #insert arguments[%1];\n", it_index);
+        return builder_to_string(*builder);
+    }
+
+    platform_init(coroutine, *packed_arguments, stack, requested_stack_size);
+
+    #if CHECK_STACK_USAGE then memset(coroutine.stack.data, 0xC0, coroutine.stack.count);
+
+    //
+    // @@NOTE: Switching to the coroutine once here so it's able to finish it's internal
+    // setup. This includes stuff like reading the packed arguments and keeping them
+    // on its stack. You can see this happening at the beginning of the_coroutine_code(...)
+    //
+    // This does **NOT** mean that when the user calls init(...) the coroutine starts running!
+    //
+    // See the first switch_context(...) call in the_coroutine_code, that's after all the setup has finished and
+    // before the user code has started executing.
+    //
+    switch_context(from = *coroutine.back_context, to = *coroutine.main_context);
 }
 
 deinit :: (coroutine : *Coroutine)
 {
     if is_initialized(coroutine)
     {
+        #if ASSERT && CHECK_STACK_USAGE
+        {
+            stack_overflow := check_stack_usage(coroutine);
+            assert(!stack_overflow, "Potential stack overflow! All the bytes on the stack were modified, which hints that it might have grown above it's allocated size");
+        }
         platform_deinit(coroutine);
         coroutine.* = .{}; 
         assert(!is_initialized(coroutine));
     }
 }
 
-run :: (coroutine : *Coroutine, deinit_when_is_done := true) -> coroutine.Return_Type
+run :: (coroutine : *Coroutine, deinit_when_is_done := true)
 {
     assert(is_initialized(coroutine));
     assert(!is_done(coroutine));
-    #if ASSERT assert(coroutine.thread_index == context.thread_index);
-    switch_context(from = *coroutine.back_context, to = *coroutine.main_context, *context);
-    return_value := coroutine.return_value;
+    coroutine.pointer_to_context.thread_index = context.thread_index;
+    switch_context(from = *coroutine.back_context, to = *coroutine.main_context);
     if deinit_when_is_done && is_done(coroutine) then deinit(coroutine);
-    return return_value;
 }
 
-yield :: (coroutine : *Coroutine) { dummy : void; yield(coroutine, dummy); }
-yield :: (coroutine : *Coroutine, return_value : coroutine.Return_Type)
+yield :: ()
 {
-    #if ASSERT assert(coroutine.thread_index == context.thread_index);
-    coroutine.return_value = return_value;
-    switch_context(from = *coroutine.main_context, to = *coroutine.back_context, *context);
+    //
+    // @@NOTE: Because we're not using any of the variable data on the
+    // coroutine that depends on the procedure it's meant to call, we can
+    // cast the opaque coroutine pointer to an arbitrary coroutine type.
+    //
+    yielding_coroutine := cast(*Coroutine(#type ()))context.current_coroutine;
+    assert(yielding_coroutine != null);
+    switch_context(from = *yielding_coroutine.main_context, to = *yielding_coroutine.back_context);
 }
 
 is_done :: (coroutine : Coroutine) -> bool
 {
-    return coroutine.done;
+    return coroutine.pointer_to_context == null;
 }
 
 is_initialized :: (coroutine : Coroutine) -> bool
@@ -151,11 +120,69 @@ is_initialized :: (coroutine : Coroutine) -> bool
     return coroutine.procedure != null;
 }
 
+#if CHECK_STACK_USAGE
+{
+    check_stack_usage :: (coroutine : Coroutine) -> overflow : bool, touched_stack_bytes : int, percentage_of_stack : float
+    {
+        //
+        // @@NOTE: When we enable stack checking we're setting the whole stack
+        // to a known byte value. The coroutine code will then use the stack, potentially
+        // touching and changing the data in it. Here we can traverse this data
+        // and see where is the deepest byte in the stack that doesn't match our
+        // known byte value. This means that the user code has written to it and that
+        // therefore the stack must have been pushed at least that deep.
+        //
+        // It's not an exact watermark of stack usage, but it can give us an estimation
+        // of how much of the stack has been used by the coroutine code. And if we see
+        // that the whole stack has been touched, it could be hinting that a stack overflow
+        // has happened. If we're running with GUARD_PAGES then we migth have caught it earlier
+        // but if the user has provided their own stack memory this could help (since we can't
+        // put guard pages on that).
+        //
+        //                                   - Ruben Osorio, 07/03/2024
+        //
+        //
+        last_untouched_byte := -1;
+        for coroutine.stack
+        {
+            if it != 0xC0 then break;
+            last_untouched_byte = it_index;
+        }
+        touched_bytes := coroutine.stack.count - last_untouched_byte;
+        return last_untouched_byte < 0, touched_bytes, (cast(float)touched_bytes)/(cast(float)coroutine.stack.count);
+    }
+}
+
 
 
 #scope_file
 
-the_coroutine_code :: no_inline (coroutine : *Coroutine, jai_context : *Context) #c_call
+
+
+generate_packed_arguments :: ($procedure_type : Type) -> Type
+{
+    #import "Compiler";
+    ARGUMENT_TYPE_COUNT :: #run type_info(procedure_type).argument_types.count;
+    ARGUMENT_TYPES :: #run () -> [ARGUMENT_TYPE_COUNT]Type
+    {
+        types : [ARGUMENT_TYPE_COUNT]Type;
+        for type_info(procedure_type).argument_types types[it_index] = get_type(it);
+        return types;
+    }();
+    #insert -> string
+    {
+        builder : String_Builder;
+        append(*builder, "Packed_Arguments :: struct {");
+        for ARGUMENT_TYPES print(*builder, "argument_%1 : ARGUMENT_TYPES[%1];", it_index);
+        append(*builder, "init_context : *Context;");
+        append(*builder, "}\n");
+        return builder_to_string(*builder);
+    }
+    return Packed_Arguments;
+}
+
+#add_context current_coroutine : *void = null;
+the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.Packed_Arguments) #c_call
 {
     //
     // @@NOTE: When jmp-ing to here from the trampoline I was getting different behaviour with and
@@ -181,26 +208,69 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, jai_context : *Context)
     {
         #bytes u8.[0x48, 0x83, 0xe4, 0xf0];
     }
-    push_context jai_context
+
+    //
+    // @@NOTE: Setting up a buffer for temporary storage, it will live on the stack of the coroutine
+    // itself so in a way the user can think of it as an "alloca" in other languages. Any allocations
+    // that overflow this storage should go into extra pages, which should all get freed after the 
+    // coroutine has returned via then reset_temporary_storage(...) below.
+    //
+    temporary_storage_buffer : [TEMPORARY_STORAGE_SIZE]u8;
+    static_temporary_storage : Temporary_Storage;
+    set_initial_data(*static_temporary_storage, temporary_storage_buffer.count, temporary_storage_buffer.data);
+
+    //
+    // @@NOTE: Instantiating a context on the stack that the coroutine will use.
+    //
+    // Some care is needed with what's in it, and some of the data, depending on what the user puts
+    // in it as well, might be incorrect. Currently it's mostly a copy of the context that initialized
+    // the coroutine, with some other members set up needed for the coroutine to run.
+    //
+    // Things like the thread_index, we can keep up-to-date by setting them through a pointer
+    // to this context that the coroutine keeps in Coroutine.pointer_to_context.
+    //
+    // In essence, this is very similar to how the context for a new thread would work, where it starts
+    // with a copy of a known context but can freely change from there onwards, so the user can look at
+    // it that way. In fact, at the time of writing, this happens to be pretty much the same as what the
+    // official threading module does.
+    //
+    //                                            - Ruben Osorio, 09/03/2024
+    //
+    new_context := arguments.init_context.*; 
+    new_context.temporary_storage = *static_temporary_storage;
+    new_context.thread_index = ~cast(type_of(new_context.thread_index))0;
+    new_context.current_coroutine = coroutine;
+    #if _STACK_TRACE
     {
-        #if coroutine.Parameter_Type == void
-        {
-            #if coroutine.Return_Type == void then coroutine.procedure(coroutine);
-            else          coroutine.return_value = coroutine.procedure(coroutine);
-        }
-        else
-        {
-            #if coroutine.Return_Type == void then coroutine.procedure(coroutine, coroutine.parameter);
-            else          coroutine.return_value = coroutine.procedure(coroutine, coroutine.parameter);
-        }
-
-
+        stack_trace_sentinel : Stack_Trace_Node;
+        new_context.stack_trace = *stack_trace_sentinel;
     }
-    coroutine.done = true;
-    switch_context(from = *coroutine.main_context, to = *coroutine.back_context, jai_context);
+
+    push_context new_context
+    {
+        coroutine.pointer_to_context = *context;
+        arguments_copy := arguments.*;
+        switch_context(from = *coroutine.main_context, to = *coroutine.back_context);
+        #insert -> string
+        {
+            builder : String_Builder;
+            append(*builder, "no_inline coroutine.procedure(");
+            for 0..type_info(coroutine.Packed_Arguments).members.count-2 // -2 cause it has init_context
+            {
+                print(*builder, "arguments_copy.argument_%,", it);
+            }
+            append(*builder, ");");
+            return builder_to_string(*builder);
+        };
+        reset_temporary_storage();
+        assert(static_temporary_storage.overflow_pages == null);
+        coroutine.pointer_to_context = null;
+    }
+
+    switch_context(from = *coroutine.main_context, to = *coroutine.back_context);
 }
 
-switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context, jai_context : *Context) #c_call
+switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context) #c_call
 {
     //
     // @@NOTE: It's important that this is a no_inline procedure as well. By not being inlined 
@@ -212,11 +282,6 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
     // Otherwise we'd be pushing the stack trace of switch_context when doing the call AFTER we
     // switched the context.stack_trace pointer.
     //
-    #if _STACK_TRACE
-    {
-        from.stack_trace = jai_context.stack_trace;
-        jai_context.stack_trace = to.stack_trace;
-    }
     platform_switch_context(from, to);
 }
 
@@ -247,20 +312,17 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
         // Some extra FP math stuff
         MXCSR : u32 = 0x1f80;
         x87_fpu_control_word : u16 = 0x27f;
-
-        // Jai's stack trace node
-        #if _STACK_TRACE stack_trace : *Stack_Trace_Node = null;
     }
 
-    platform_init :: (coroutine : *Coroutine, requested_stack_size : int)
+    platform_init :: (coroutine : *Coroutine, arguments : *coroutine.Packed_Arguments, user_provided_stack : []u8, requested_stack_size : int)
     {
         // Setup the stack's top (highest address) and bottom (lowest address)
         stack_bottom : *u8;
         stack_top    : *u8;
-        if coroutine.stack_allocation
+        if user_provided_stack
         {
-            stack_bottom = coroutine.stack_allocation.data;
-            stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count;
+            stack_bottom = user_provided_stack.data;
+            stack_top    = user_provided_stack.data + user_provided_stack.count;
         }
         else
         {
@@ -268,7 +330,6 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
             siSysInfo : Windows.SYSTEM_INFO;
             Windows.GetNativeSystemInfo(*siSysInfo);
             page_size : int = ifx siSysInfo.dwPageSize > 16 then siSysInfo.dwPageSize else 16;
-            coroutine.owns_stack = true;
             coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
             coroutine.stack_allocation.data = Windows.VirtualAlloc(null, cast(u64) coroutine.stack_allocation.count, Windows.MEM_RESERVE | Windows.MEM_COMMIT, Windows.PAGE_READWRITE);
             assert(coroutine.stack_allocation.data != null);
@@ -284,11 +345,12 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
             // Put the stack in between the two guard pages 
             stack_bottom = coroutine.stack_allocation.data                                    + (ifx GUARD_PAGES then page_size else 0);
             stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count - (ifx GUARD_PAGES then page_size else 0);
-
         }
         stack_bottom = (stack_bottom + 15) & ~15;
-        stack_top    = (stack_top    + 15) & ~15;
-        
+        stack_top = stack_top & ~15;
+        coroutine.stack.data  = stack_bottom; 
+        coroutine.stack.count = stack_top - stack_bottom; 
+
         // Setup the initial state of the registers in the coroutine context
         trampoline :: no_inline () #c_call // Procedure to jump to on the first run of the coroutine
         {
@@ -298,8 +360,8 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
                 #run print_bytes_array(BYTES);
                 BYTES :: #run x64_to_bytes(#string DONE
                     mov rcx, r13   # *Coroutine
-                    mov rdx, r14   # *Context
-                    jmp r12        # jumping to the_coroutine_code(*Coroutine, *Context)
+                    mov rdx, r14   # *Coroutine.Packed_Arguments
+                    jmp r12        # jumping to the_coroutine_code(*Coroutine, *Coroutine.Packed_Arguments)
                 DONE);
             }
             else
@@ -307,12 +369,12 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
                 #bytes u8.[0x4c, 0x89, 0xe9, 0x4c, 0x89, 0xf2, 0x41, 0xff, 0xe4];
             }
         }
-        COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, *context));
+        COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, arguments));
         coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);     // Address we're going to jump to in the first execution
         coroutine.main_context.rsp = cast(u64)(stack_top);                 // Stack pointer
         coroutine.main_context.r12 = cast(u64)cast(*void)(COROUTINE_CODE); // Address the trampoline will jump to
         coroutine.main_context.r13 = cast(u64)(coroutine);                 // The pointer to the coroutine data
-        coroutine.main_context.r14 = cast(u64)(*context);                  // The pointer to the current Jai context
+        coroutine.main_context.r14 = cast(u64)(arguments);                 // The pointer to the coroutine's arguments 
 
         // Setup the initial state of Window's TIB or Thread Information Block stuff: https://en.wikipedia.org/wiki/Win32_Thread_Information_Block
         coroutine.main_context.stack_base    = cast(u64)stack_top;
@@ -349,7 +411,7 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context,
 
     platform_deinit :: (coroutine : *Coroutine)
     {
-        if coroutine.owns_stack
+        if coroutine.stack_allocation
         {
             Windows.VirtualFree(coroutine.stack_allocation.data, 0, Windows.MEM_RELEASE);
         }
@@ -533,27 +595,23 @@ else #if OS == .MACOS || OS == .LINUX
         // Some extra FP math stuff
         MXCSR : u32 = 0x1f80;
         x87_fpu_control_word : u16 = 0x27f;
-
-        // Jai's stack trace node
-        #if _STACK_TRACE stack_trace : *Stack_Trace_Node = null;
     }
 
-    platform_init :: (coroutine : *Coroutine, requested_stack_size : int)
+    platform_init :: (coroutine : *Coroutine, arguments : *coroutine.Packed_Arguments, requested_stack_size : int)
     {
         // Setup the stack's top (highest address) and bottom (lowest address)
         stack_bottom : *u8;
         stack_top    : *u8;
-        if coroutine.stack_allocation
+        if user_provided_stack
         {
-            stack_bottom = coroutine.stack_allocation.data;
-            stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count;
+            stack_bottom = user_provided_stack.data;
+            stack_top    = user_provided_stack.data + user_provided_stack.count;
         }
         else
         {
             // Allocate memory for the stack and set up a guard page at the beginning and end of it
             posix_page_size : int = POSIX.sysconf(POSIX._SC_PAGE_SIZE);
             page_size := ifx posix_page_size > 16 then posix_page_size else 16;
-            coroutine.owns_stack = true;
             coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
             MAP_STACK :: 0x20000;
             coroutine.stack_allocation.data = POSIX.mmap(null, cast(u64) coroutine.stack_allocation.count, prot = POSIX.PROT_READ | POSIX.PROT_WRITE, flags = POSIX.MAP_PRIVATE | POSIX.MAP_ANONYMOUS | MAP_STACK, fildes = -1, offset = 0);
@@ -571,15 +629,34 @@ else #if OS == .MACOS || OS == .LINUX
             stack_top    = coroutine.stack_allocation.data + coroutine.stack_allocation.count - (ifx GUARD_PAGES then page_size else 0);
         }
         stack_bottom = (stack_bottom + 15) & ~15;
-        stack_top    = (stack_top    + 15) & ~15;
+        stack_top = stack_top & ~15;
+        coroutine.stack.data  = stack_bottom; 
+        coroutine.stack.count = stack_top - stack_bottom; 
 
         // Setup the initial state of the registers in the coroutine context
-        COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, *context));
+        trampoline :: no_inline () #c_call // Procedure to jump to on the first run of the coroutine
+        {
+            #if ASSEMBLE 
+            {
+                #bytes BYTES;
+                #run print_bytes_array(BYTES);
+                BYTES :: #run x64_to_bytes(#string DONE
+                    mov rdi, r13   # *Coroutine
+                    mov rsi, r14   # *Coroutine.Packed_Arguments
+                    jmp r12        # jumping to the_coroutine_code(*Coroutine, *Coroutine.Packed_Arguments)
+                DONE);
+            }
+            else
+            {
+                #bytes u8.[0x4c, 0x89, 0xef, 0x4c, 0x89, 0xf6, 0x41, 0xff, 0xe4];
+            }
+        }
+        COROUTINE_CODE :: #procedure_of_call(the_coroutine_code(coroutine, arguments));
         coroutine.main_context.rip = cast(u64)cast(*void)(trampoline);     // Address we're going to jump to in the first execution
         coroutine.main_context.rsp = cast(u64)(stack_top);                 // Stack pointer
         coroutine.main_context.r12 = cast(u64)cast(*void)(COROUTINE_CODE); // Address the trampoline will jump to
-        coroutine.main_context.r13 = cast(u64)(coroutine);                 // Coroutine procedure that start will call
-        coroutine.main_context.r14 = cast(u64)(*context);                  // The pointer to the current Jai context
+        coroutine.main_context.r13 = cast(u64)(coroutine);                 // The pointer to the coroutine data
+        coroutine.main_context.r14 = cast(u64)(arguments);                 // The pointer to the coroutine's arguments 
 
         // Setup the initial state of some of the floating point math control registers
         {
@@ -606,30 +683,11 @@ else #if OS == .MACOS || OS == .LINUX
                 #bytes u8.[0x41, 0xd9, 0x3a];
             }
         }
-
-        // Procedure to jump to on the first run of the coroutine
-        trampoline :: no_inline () #c_call
-        {
-            #if ASSEMBLE 
-            {
-                #bytes BYTES;
-                #run print_bytes_array(BYTES);
-                BYTES :: #run x64_to_bytes(#string DONE
-                    mov rdi, r13   # *Coroutine
-                    mov rsi, r14   # *Context
-                    jmp r12        # jumping to the_coroutine_code(*Coroutine, *Context)
-                DONE);
-            }
-            else
-            {
-                #bytes u8.[0x4c, 0x89, 0xef, 0x4c, 0x89, 0xf6, 0x41, 0xff, 0xe4];
-            }
-        }
     }
 
     platform_deinit :: (coroutine : *Coroutine)
     {
-        if coroutine.owns_stack
+        if coroutine.stack_allocation
         {
             unmap_result := POSIX.munmap(coroutine.stack_allocation.data, xx coroutine.stack_allocation.count);
             assert(unmap_result == 0);
