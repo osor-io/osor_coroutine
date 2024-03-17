@@ -278,11 +278,16 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
     // the volatile registers (and state in general) might be gone by the time we return from this, which
     // means that on our coroutine contexts we only have to store the non-volatile stuff for that given platform.
     //
-    // @@NOTE: This needs to be a #c_call (or possibly a #no_context) so we don't push stack traces.
-    // Otherwise we'd be pushing the stack trace of switch_context when doing the call AFTER we
-    // switched the context.stack_trace pointer.
+    // @@NOTE: Adding a fences here to prevent the compiler from optimizing ordering around context switches,
+    // although this might already be happening with this being a non-inlined procedure call. Also gives us
+    // serializing behaviour when jumping to/from the coroutine code which may be relevant in multithreading
+    // environments. The behaviour of these is well explained in here:
     //
+    //  - https://hadibrais.wordpress.com/2018/05/14/the-significance-of-the-x86-lfence-instruction/
+    //
+    #asm { mfence; lfence; }
     platform_switch_context(from, to);
+    #asm { mfence; lfence; }
 }
 
 #if OS == .WINDOWS
