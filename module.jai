@@ -93,6 +93,7 @@ run :: (coroutine : *Coroutine, deinit_when_is_done := true)
 {
     assert(is_initialized(coroutine));
     assert(!is_done(coroutine));
+    coroutine.pointer_to_context.current_coroutine = cast(*void)coroutine;
     coroutine.pointer_to_context.thread_index = context.thread_index;
     switch_context(from = *coroutine.back_context, to = *coroutine.main_context);
     if deinit_when_is_done && is_done(coroutine) then deinit(coroutine);
@@ -100,14 +101,8 @@ run :: (coroutine : *Coroutine, deinit_when_is_done := true)
 
 yield :: ()
 {
-    //
-    // @@NOTE: Because we're not using any of the variable data on the
-    // coroutine that depends on the procedure it's meant to call, we can
-    // cast the opaque coroutine pointer to an arbitrary coroutine type.
-    //
-    yielding_coroutine := cast(*Coroutine(#type ()))context.current_coroutine;
-    assert(yielding_coroutine != null);
-    switch_context(from = *yielding_coroutine.main_context, to = *yielding_coroutine.back_context);
+    assert(context.current_coroutine != null);
+    switch_context(from = *context.current_coroutine.main_context, to = *context.current_coroutine.back_context);
 }
 
 is_done :: (coroutine : Coroutine) -> bool
@@ -181,7 +176,16 @@ generate_packed_arguments :: ($procedure_type : Type) -> Type
     return Packed_Arguments;
 }
 
-#add_context current_coroutine : *void = null;
+//
+// @@NOTE: We can use a coroutine that points to a generic procedure
+// for most things, because the only variable data it has is really the
+// Procedure_Type which we only really use at the beginning when starting
+// to execute the_coroutine_code for the first time.
+//
+// For switching contexts or other purposes, we don't need
+// that type information, so this can be used directly.
+//
+#add_context current_coroutine : *Coroutine(#type ()) = null;
 the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.Packed_Arguments) #c_call
 {
     //
@@ -239,7 +243,7 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.
     new_context := arguments.init_context.*; 
     new_context.temporary_storage = *static_temporary_storage;
     new_context.thread_index = ~cast(type_of(new_context.thread_index))0;
-    new_context.current_coroutine = coroutine;
+    new_context.current_coroutine = cast(*void)coroutine;
     #if _STACK_TRACE
     {
         stack_trace_sentinel : Stack_Trace_Node;
@@ -250,24 +254,36 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.
     {
         coroutine.pointer_to_context = *context;
         arguments_copy := arguments.*;
-        switch_context(from = *coroutine.main_context, to = *coroutine.back_context);
+        procedure := coroutine.procedure;
+        switch_context(from = *context.current_coroutine.main_context, to = *context.current_coroutine.back_context);
+
+        //
+        // @@NOTE: From this point onward, we cannot use the *Couroutine given to us as a parameter
+        // because the user might do a copy of the coroutine and call run on that one instead, therefore
+        // invalidating the memory that the original coroutine pointer we have head points at. 
+        //
+        // To get around that issue, we can refer to the true coroutine we're running via the one that's
+        // in the context, because we can update that one as we call run(...).
+        //
+
         #insert -> string
         {
             builder : String_Builder;
-            append(*builder, "no_inline coroutine.procedure(");
-            for 0..type_info(coroutine.Packed_Arguments).members.count-2 // -2 cause it has init_context
+            append(*builder, "no_inline procedure(");
+            for 0..type_info(type_of(arguments_copy)).members.count-2 // -2 cause it has init_context
             {
                 print(*builder, "arguments_copy.argument_%,", it);
             }
             append(*builder, ");");
             return builder_to_string(*builder);
         };
+
         reset_temporary_storage();
         assert(static_temporary_storage.overflow_pages == null);
-        coroutine.pointer_to_context = null;
+        #asm { mfence; lfence; }
+        context.current_coroutine.pointer_to_context = null;
+        switch_context(from = *context.current_coroutine.main_context, to = *context.current_coroutine.back_context);
     }
-
-    switch_context(from = *coroutine.main_context, to = *coroutine.back_context);
 }
 
 switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context) #c_call
