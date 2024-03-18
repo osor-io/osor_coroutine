@@ -36,24 +36,35 @@ Coroutine :: struct (Procedure_Type : Type)
     #assert(type_info(Procedure_Type).type == .PROCEDURE);
     #assert(type_info(Procedure_Type).return_types.count == 0);
     Packed_Arguments :: #run generate_packed_arguments(Procedure_Type);
+    #assert(type_info(Procedure_Type).argument_types.count == type_info(Packed_Arguments).members.count-1);
 }
 
 init :: (coroutine : *Coroutine,
          procedure : type_of(coroutine.procedure),
          $arguments : ..Code,
          stack : []u8 = .[],
-         requested_stack_size := DEFAULT_STACK_SIZE) #expand
+         requested_stack_size := DEFAULT_STACK_SIZE,
+         loc := #caller_location) #expand
 {
+    #run
+    {
+        if arguments.count != type_info(coroutine.Procedure_Type).argument_types.count
+        {
+            compiler_report(tprint("Trying to initialize a coroutine that takes % arguments but % were provided, the procedure type is %", type_info(coroutine.Procedure_Type).argument_types.count, arguments.count, coroutine.Procedure_Type), loc);
+        }
+    }
+
     assert(!is_initialized(coroutine));
     coroutine.* = .{}; 
     coroutine.procedure = procedure;
 
-    packed_arguments : coroutine.Packed_Arguments;
-    packed_arguments.init_context = *context;
     #insert -> string
     {
         builder : String_Builder;
-        for arguments print(*builder, "packed_arguments.argument_%1 = #insert arguments[%1];\n", it_index);
+        append(*builder, "packed_arguments := coroutine.Packed_Arguments.{");
+        for arguments print(*builder, "#insert arguments[%1],\n", it_index);
+        append(*builder, "*context\n");
+        append(*builder, "};");
         return builder_to_string(*builder);
     }
 
@@ -154,9 +165,12 @@ is_initialized :: (coroutine : Coroutine) -> bool
 
 
 
+#import "Compiler";
+
+
+
 generate_packed_arguments :: ($procedure_type : Type) -> Type
 {
-    #import "Compiler";
     ARGUMENT_TYPE_COUNT :: #run type_info(procedure_type).argument_types.count;
     ARGUMENT_TYPES :: #run () -> [ARGUMENT_TYPE_COUNT]Type
     {
