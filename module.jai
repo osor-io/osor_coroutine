@@ -27,7 +27,7 @@ Coroutine :: struct (Procedure_Type : Type)
     main_context : Coroutine_Context #align 16;
     back_context : Coroutine_Context #align 16;
 
-    pointer_to_context : *Context;
+    pointer_to_context : *#Context;
 
     stack : []u8;
     stack_allocation : []u8;
@@ -183,7 +183,7 @@ generate_packed_arguments :: ($procedure_type : Type) -> Type
         builder : String_Builder;
         append(*builder, "Packed_Arguments :: struct {");
         for ARGUMENT_TYPES print(*builder, "argument_%1 : ARGUMENT_TYPES[%1];", it_index);
-        append(*builder, "init_context : *Context;");
+        append(*builder, "init_context : *#Context;");
         append(*builder, "}\n");
         return builder_to_string(*builder);
     }
