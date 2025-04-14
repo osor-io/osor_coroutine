@@ -17,8 +17,6 @@
 
 
 #module_parameters(ASSERT := true, GUARD_PAGES := true, DEFAULT_STACK_SIZE := 64 * 1024, TEMPORARY_STORAGE_SIZE := 4 * 1024, CHECK_STACK_USAGE := false);
-#if ASSERT #import "Basic";
-else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
 
 
 
@@ -166,6 +164,8 @@ is_initialized :: (coroutine : Coroutine) -> bool
 
 
 #import "Compiler";
+#if ASSERT #import "Basic";
+else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
 
 
 
@@ -264,7 +264,7 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.
         new_context.stack_trace = *stack_trace_sentinel;
     }
 
-    push_context new_context
+    push_context *new_context
     {
         coroutine.pointer_to_context = *context;
         arguments_copy := arguments.*;
