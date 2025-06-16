@@ -44,6 +44,8 @@ init :: (coroutine : *Coroutine,
          requested_stack_size := DEFAULT_STACK_SIZE,
          loc := #caller_location) #expand
 {
+    init_module_if_needed();
+
     #run
     {
         if arguments.count != type_info(coroutine.Procedure_Type).argument_types.count
@@ -164,6 +166,7 @@ is_initialized :: (coroutine : Coroutine) -> bool
 
 
 #import "Compiler";
+#import "Atomics";
 #if ASSERT #import "Basic";
 else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
 
@@ -214,17 +217,24 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.
     //
     //                                                     - Ruben Osorio, 04/01/2023
     //
-    #if ASSEMBLE 
+    #if CPU == .X64
     {
-        #bytes BYTES;
-        #run print_bytes_array(BYTES);
-        BYTES :: #run x64_to_bytes(#string DONE
-            and rsp, -16 # Aligning the stack to 16 bytes
-        DONE);
+        #if ASSEMBLE && false 
+        {
+            BYTES :: #run x64_to_bytes(#string DONE
+                and rsp, -16 # Aligning the stack to 16 bytes
+            DONE);
+            #run print_bytes_array(BYTES);
+            #bytes BYTES;
+        }
+        else
+        {
+            #bytes u8.[0x48, 0x83, 0xe4, 0xf0];
+        }
     }
     else
     {
-        #bytes u8.[0x48, 0x83, 0xe4, 0xf0];
+        #assert(false); // Do we need to align the stack in other architectures?
     }
 
     //
@@ -294,7 +304,7 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.
 
         reset_temporary_storage();
         assert(static_temporary_storage.overflow_pages == null);
-        #asm { mfence; lfence; }
+        memory_fences();
         context.current_coroutine.pointer_to_context = null;
         switch_context(from = *context.current_coroutine.main_context, to = *context.current_coroutine.back_context);
     }
@@ -315,12 +325,26 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
     //
     //  - https://hadibrais.wordpress.com/2018/05/14/the-significance-of-the-x86-lfence-instruction/
     //
-    #asm { mfence; lfence; }
+    memory_fences();
     platform_switch_context(from, to);
-    #asm { mfence; lfence; }
+    memory_fences();
 }
 
-#if OS == .WINDOWS
+initialized_module : u32 = 0;
+init_module_if_needed :: ()
+{
+    if initialized_module == 0xFFFFFFFF then return;
+    previous := atomic_add(*initialized_module, 1);
+    if previous == 0
+    {
+        defer initialized_module = 0xFFFFFFFF;
+        platform_init_switch_context_code();
+    }
+    else while initialized_module != 0xFFFFFFFF pause();
+    memory_fences();
+}
+
+#if OS == .WINDOWS && CPU == .X64
 {
     Windows :: #import "Windows";
 
@@ -373,8 +397,8 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
                 dummy : u32 = 0;
                 protect_result_bottom_page := Windows.VirtualProtect(coroutine.stack_allocation.data,                                                cast(u64)page_size, Windows.PAGE_GUARD | Windows.PAGE_READWRITE, *dummy);
                 protect_result_top_page    := Windows.VirtualProtect(coroutine.stack_allocation.data + coroutine.stack_allocation.count - page_size, cast(u64)page_size, Windows.PAGE_GUARD | Windows.PAGE_READWRITE, *dummy);
-                assert(protect_result_bottom_page != 0);
-                assert(protect_result_top_page    != 0);
+                assert(protect_result_bottom_page == .TRUE);
+                assert(protect_result_top_page    == .TRUE);
             }
 
             // Put the stack in between the two guard pages 
@@ -389,15 +413,15 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
         // Setup the initial state of the registers in the coroutine context
         trampoline :: no_inline () #c_call // Procedure to jump to on the first run of the coroutine
         {
-            #if ASSEMBLE 
+            #if ASSEMBLE && false 
             {
-                #bytes BYTES;
-                #run print_bytes_array(BYTES);
                 BYTES :: #run x64_to_bytes(#string DONE
                     mov rcx, r13   # *Coroutine
                     mov rdx, r14   # *Coroutine.Packed_Arguments
                     jmp r12        # jumping to the_coroutine_code(*Coroutine, *Coroutine.Packed_Arguments)
                 DONE);
+                #run print_bytes_array(BYTES);
+                #bytes BYTES;
             }
             else
             {
@@ -418,30 +442,7 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
         coroutine.main_context.fiber_storage = cast(u64)0; // Documentation is non-existant but people leave this as zero: https://github.com/boostorg/context/blob/develop/src/asm/make_x86_64_ms_pe_masm.asm 
 
         // Setup the initial state of some of the floating point math control registers
-        {
-            mxcsr_pointer                := *coroutine.main_context.MXCSR;
-            x87_fpu_control_word_pointer := *coroutine.main_context.x87_fpu_control_word;
-            #asm
-            {
-                stmxcsr [mxcsr_pointer];
-                // I really wanted to do just: fnstcw [x87_fpu_control_word_pointer];
-                // but we don't have that instruction, so pinning to a register and doing
-                // it with a #bytes:
-                mov r10 : gpr === 10, x87_fpu_control_word_pointer;
-            }
-            #if ASSEMBLE 
-            {
-                #bytes BYTES;
-                #run print_bytes_array(BYTES);
-                BYTES :: #run x64_to_bytes(#string DONE
-                    fnstcw [r10]
-                DONE);
-            }
-            else
-            {
-                #bytes u8.[0x41, 0xd9, 0x3a];
-            }
-        }
+        platform_set_up_floating_point_control_registers(*coroutine.main_context.MXCSR, *coroutine.main_context.x87_fpu_control_word);
     }
 
     platform_deinit :: (coroutine : *Coroutine)
@@ -452,18 +453,31 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
         }
     }
 
-    platform_switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context) #c_call
+    //
+    // @@TODO: Right now we're copying the switch-context assembly to executable memory by hand.
+    //
+    // I would love to avoid having to do this!
+    //
+    // The limitation is that at the time of writing there's no way to put a #bytes outside
+    // an imperative scope. So we can't do:
+    //
+    //     PLATFORM_SWITCH_CONTEXT_BYTES :: #bytes u8.[/*...*/];
+    // 
+    // Or even just this directly
+    // 
+    //     platform_switch_context : #type (from : *Coroutine_Context, to : *Coroutine_Context) #c_call : #bytes u8.[/*...*/]; 
+    //
+    // But alas, this is not doable now, so trying to go with an approach that doesn't require #asm since it looks
+    // like it will be going away in its current form.
+    //
+    //                                                           - Ruben Osorio, 16/06/2025
+    //
+    platform_switch_context : #type (from : *Coroutine_Context, to : *Coroutine_Context) #c_call = null; 
+    platform_init_switch_context_code :: ()
     {
-        #asm
+        #if ASSEMBLE && false 
         {
-            mov rcx: gpr === c, from;
-            mov rdx: gpr === d, to;
-        }
-        #if ASSEMBLE 
-        {
-            #bytes BYTES;
-            #run print_bytes_array(BYTES);
-            BYTES :: #run x64_to_bytes(#string DONE
+            PLATFORM_SWITCH_CONTEXT_BYTES :: #run x64_to_bytes(#string DONE
                 # Compute the return address, [rip+offset] points to the instruction after the last jmp of this block
                 lea rax,[rip+0x158] # IMPORTANT!! Update this offset if the assembly changes!!
 
@@ -564,61 +578,118 @@ switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context)
                 # Might as well JMP
                 jmp [rdx]
 
-                # Leaving Jai to do the final ret, because it might need to do stuff
-                # like popping the shadow space it allocated at the beginning, popping rbp, etc. 
+                # And returning at the end, for when we finish and come back here
+                ret
+
+                # Padding with a few interrupts to catch issues
+                int 3
+                int 3
+                int 3
+                int 3
+                int 3
+                int 3
+                int 3
+                int 3
             DONE);
+            #run print_bytes_array(PLATFORM_SWITCH_CONTEXT_BYTES);
         }
         else
         {
-            #bytes u8.[0x48, 0x8d, 0x05, 0x58, 0x01, 0x00, 0x00, 0x48,
-                       0x89, 0x01, 0x48, 0x89, 0x61, 0x08, 0x48, 0x89,
-                       0x69, 0x10, 0x48, 0x89, 0x59, 0x18, 0x4c, 0x89,
-                       0x61, 0x20, 0x4c, 0x89, 0x69, 0x28, 0x4c, 0x89,
-                       0x71, 0x30, 0x4c, 0x89, 0x79, 0x38, 0x48, 0x89,
-                       0x79, 0x40, 0x48, 0x89, 0x71, 0x48, 0x0f, 0x29,
-                       0x71, 0x50, 0x0f, 0x29, 0x79, 0x60, 0x44, 0x0f,
-                       0x29, 0x41, 0x70, 0x44, 0x0f, 0x29, 0x89, 0x80,
-                       0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0x91, 0x90,
-                       0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0x99, 0xa0,
-                       0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xa1, 0xb0,
-                       0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xa9, 0xc0,
-                       0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xb1, 0xd0,
-                       0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xb9, 0xe0,
-                       0x00, 0x00, 0x00, 0x65, 0x4c, 0x8b, 0x14, 0x25,
-                       0x30, 0x00, 0x00, 0x00, 0x49, 0x8b, 0x42, 0x08,
-                       0x48, 0x89, 0x81, 0xf0, 0x00, 0x00, 0x00, 0x49,
-                       0x8b, 0x42, 0x10, 0x48, 0x89, 0x81, 0xf8, 0x00,
-                       0x00, 0x00, 0x49, 0x8b, 0x82, 0x78, 0x14, 0x00,
-                       0x00, 0x48, 0x89, 0x81, 0x00, 0x01, 0x00, 0x00,
-                       0x49, 0x8b, 0x42, 0x20, 0x48, 0x89, 0x81, 0x08,
-                       0x01, 0x00, 0x00, 0x0f, 0xae, 0x99, 0x10, 0x01,
-                       0x00, 0x00, 0xd9, 0xb9, 0x14, 0x01, 0x00, 0x00,
-                       0xd9, 0xaa, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xae,
-                       0x92, 0x10, 0x01, 0x00, 0x00, 0x48, 0x8b, 0x82,
-                       0x08, 0x01, 0x00, 0x00, 0x49, 0x89, 0x42, 0x20,
-                       0x48, 0x8b, 0x82, 0x00, 0x01, 0x00, 0x00, 0x49,
-                       0x89, 0x82, 0x78, 0x14, 0x00, 0x00, 0x48, 0x8b,
-                       0x82, 0xf8, 0x00, 0x00, 0x00, 0x49, 0x89, 0x42,
-                       0x10, 0x48, 0x8b, 0x82, 0xf0, 0x00, 0x00, 0x00,
-                       0x49, 0x89, 0x42, 0x08, 0x44, 0x0f, 0x28, 0xba,
-                       0xe0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0xb2,
-                       0xd0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0xaa,
-                       0xc0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0xa2,
-                       0xb0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x9a,
-                       0xa0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x92,
-                       0x90, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x8a,
-                       0x80, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x42,
-                       0x70, 0x0f, 0x28, 0x7a, 0x60, 0x0f, 0x28, 0x72,
-                       0x50, 0x48, 0x8b, 0x72, 0x48, 0x48, 0x8b, 0x7a,
-                       0x40, 0x4c, 0x8b, 0x7a, 0x38, 0x4c, 0x8b, 0x72,
-                       0x30, 0x4c, 0x8b, 0x6a, 0x28, 0x4c, 0x8b, 0x62,
-                       0x20, 0x48, 0x8b, 0x5a, 0x18, 0x48, 0x8b, 0x6a,
-                       0x10, 0x48, 0x8b, 0x62, 0x08, 0xff, 0x22, ];
+            PLATFORM_SWITCH_CONTEXT_BYTES :: u8.[
+                0x48, 0x8d, 0x05, 0x58, 0x01, 0x00, 0x00, 0x48,
+                0x89, 0x01, 0x48, 0x89, 0x61, 0x08, 0x48, 0x89,
+                0x69, 0x10, 0x48, 0x89, 0x59, 0x18, 0x4c, 0x89,
+                0x61, 0x20, 0x4c, 0x89, 0x69, 0x28, 0x4c, 0x89,
+                0x71, 0x30, 0x4c, 0x89, 0x79, 0x38, 0x48, 0x89,
+                0x79, 0x40, 0x48, 0x89, 0x71, 0x48, 0x0f, 0x29,
+                0x71, 0x50, 0x0f, 0x29, 0x79, 0x60, 0x44, 0x0f,
+                0x29, 0x41, 0x70, 0x44, 0x0f, 0x29, 0x89, 0x80,
+                0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0x91, 0x90,
+                0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0x99, 0xa0,
+                0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xa1, 0xb0,
+                0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xa9, 0xc0,
+                0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xb1, 0xd0,
+                0x00, 0x00, 0x00, 0x44, 0x0f, 0x29, 0xb9, 0xe0,
+                0x00, 0x00, 0x00, 0x65, 0x4c, 0x8b, 0x14, 0x25,
+                0x30, 0x00, 0x00, 0x00, 0x49, 0x8b, 0x42, 0x08,
+                0x48, 0x89, 0x81, 0xf0, 0x00, 0x00, 0x00, 0x49,
+                0x8b, 0x42, 0x10, 0x48, 0x89, 0x81, 0xf8, 0x00,
+                0x00, 0x00, 0x49, 0x8b, 0x82, 0x78, 0x14, 0x00,
+                0x00, 0x48, 0x89, 0x81, 0x00, 0x01, 0x00, 0x00,
+                0x49, 0x8b, 0x42, 0x20, 0x48, 0x89, 0x81, 0x08,
+                0x01, 0x00, 0x00, 0x0f, 0xae, 0x99, 0x10, 0x01,
+                0x00, 0x00, 0xd9, 0xb9, 0x14, 0x01, 0x00, 0x00,
+                0xd9, 0xaa, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xae,
+                0x92, 0x10, 0x01, 0x00, 0x00, 0x48, 0x8b, 0x82,
+                0x08, 0x01, 0x00, 0x00, 0x49, 0x89, 0x42, 0x20,
+                0x48, 0x8b, 0x82, 0x00, 0x01, 0x00, 0x00, 0x49,
+                0x89, 0x82, 0x78, 0x14, 0x00, 0x00, 0x48, 0x8b,
+                0x82, 0xf8, 0x00, 0x00, 0x00, 0x49, 0x89, 0x42,
+                0x10, 0x48, 0x8b, 0x82, 0xf0, 0x00, 0x00, 0x00,
+                0x49, 0x89, 0x42, 0x08, 0x44, 0x0f, 0x28, 0xba,
+                0xe0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0xb2,
+                0xd0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0xaa,
+                0xc0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0xa2,
+                0xb0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x9a,
+                0xa0, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x92,
+                0x90, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x8a,
+                0x80, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x28, 0x42,
+                0x70, 0x0f, 0x28, 0x7a, 0x60, 0x0f, 0x28, 0x72,
+                0x50, 0x48, 0x8b, 0x72, 0x48, 0x48, 0x8b, 0x7a,
+                0x40, 0x4c, 0x8b, 0x7a, 0x38, 0x4c, 0x8b, 0x72,
+                0x30, 0x4c, 0x8b, 0x6a, 0x28, 0x4c, 0x8b, 0x62,
+                0x20, 0x48, 0x8b, 0x5a, 0x18, 0x48, 0x8b, 0x6a,
+                0x10, 0x48, 0x8b, 0x62, 0x08, 0xff, 0x22, 0xc3,
+                0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+            ];
         }
+        platform_switch_context = Windows.VirtualAlloc(null, PLATFORM_SWITCH_CONTEXT_BYTES.count, Windows.MEM_RESERVE | Windows.MEM_COMMIT, Windows.PAGE_EXECUTE_READWRITE);
+        assert(platform_switch_context != null);
+        memcpy(cast(*void)platform_switch_context, PLATFORM_SWITCH_CONTEXT_BYTES.data, PLATFORM_SWITCH_CONTEXT_BYTES.count);
+        dummy_old_protect_flags : u32;
+        virtualprotect_executable_result := Windows.VirtualProtect(cast(*void)platform_switch_context, PLATFORM_SWITCH_CONTEXT_BYTES.count, Windows.PAGE_EXECUTE, *dummy_old_protect_flags);
+        assert(virtualprotect_executable_result == .TRUE);
     }
 
+    //
+    // @@TODO: Going through a procedure pointer here to force the calling code to pass in the parameters!
+    //
+    // If the procedure is only using them inside a #bytes, the generated code doesn't set up
+    // the parameters at all, I imagine because it thinks they are unused.
+    //
+    // This forces it to pass them, because it doesn't know which procedure the pointer might resolve to.
+    //
+    // Another way to fix this is to have this at the beginning of the procedure:
+    //
+    //     #asm
+    //     {
+    //         mov rcx: gpr === c, mxcsr_pointer;
+    //         mov rdx: gpr === d, x87_fpu_control_word_pointer;
+    //     }
+    //
+    // But #asm might be going away the way it is now, so that won't help us in the future.
+    //
+    //                                              - Ruben Osorio, 16/06/2025
+    //
+    platform_set_up_floating_point_control_registers := _platform_set_up_floating_point_control_registers;
+    _platform_set_up_floating_point_control_registers :: no_inline (mxcsr_pointer : *u32, x87_fpu_control_word_pointer : *u16) #c_call
+    {
+        #if ASSEMBLE && false 
+        {
+            BYTES :: #run x64_to_bytes(#string DONE
+                stmxcsr [rcx]
+                fnstcw  [rdx]
+            DONE);
+            #run print_bytes_array(BYTES);
+            #bytes BYTES;
+        }
+        else
+        {
+            #bytes u8.[0x0f, 0xae, 0x19, 0xd9, 0x3a];
+        }
+    }
 }
-else #if OS == .MACOS || OS == .LINUX
+else #if (OS == .MACOS || OS == .LINUX) && CPU == .X64
 {
     POSIX :: #import "POSIX";
 
@@ -632,7 +703,7 @@ else #if OS == .MACOS || OS == .LINUX
         x87_fpu_control_word : u16 = 0x27f;
     }
 
-    platform_init :: (coroutine : *Coroutine, arguments : *coroutine.Packed_Arguments, requested_stack_size : int)
+    platform_init :: (coroutine : *Coroutine, arguments : *coroutine.Packed_Arguments, user_provided_stack : []u8, requested_stack_size : int)
     {
         // Setup the stack's top (highest address) and bottom (lowest address)
         stack_bottom : *u8;
@@ -645,11 +716,11 @@ else #if OS == .MACOS || OS == .LINUX
         else
         {
             // Allocate memory for the stack and set up a guard page at the beginning and end of it
-            posix_page_size : int = POSIX.sysconf(POSIX._SC_PAGE_SIZE);
+            posix_page_size : int = POSIX.sysconf(POSIX._SC_PAGESIZE);
             page_size := ifx posix_page_size > 16 then posix_page_size else 16;
             coroutine.stack_allocation.count = (((requested_stack_size + page_size - 1) / page_size) * page_size) + (ifx GUARD_PAGES then (2 * page_size) else 0);
             MAP_STACK :: 0x20000;
-            coroutine.stack_allocation.data = POSIX.mmap(null, cast(u64) coroutine.stack_allocation.count, prot = POSIX.PROT_READ | POSIX.PROT_WRITE, flags = POSIX.MAP_PRIVATE | POSIX.MAP_ANONYMOUS | MAP_STACK, fildes = -1, offset = 0);
+            coroutine.stack_allocation.data = POSIX.mmap(null, cast(u64) coroutine.stack_allocation.count, POSIX.PROT_READ | POSIX.PROT_WRITE, POSIX.MAP_PRIVATE | POSIX.MAP_ANONYMOUS | MAP_STACK, -1, 0);
             assert(coroutine.stack_allocation.data != null && coroutine.stack_allocation.data != cast(*void)-1);
             #if GUARD_PAGES
             {
@@ -671,15 +742,15 @@ else #if OS == .MACOS || OS == .LINUX
         // Setup the initial state of the registers in the coroutine context
         trampoline :: no_inline () #c_call // Procedure to jump to on the first run of the coroutine
         {
-            #if ASSEMBLE 
+            #if ASSEMBLE && false 
             {
-                #bytes BYTES;
-                #run print_bytes_array(BYTES);
                 BYTES :: #run x64_to_bytes(#string DONE
                     mov rdi, r13   # *Coroutine
                     mov rsi, r14   # *Coroutine.Packed_Arguments
                     jmp r12        # jumping to the_coroutine_code(*Coroutine, *Coroutine.Packed_Arguments)
                 DONE);
+                #run print_bytes_array(BYTES);
+                #bytes BYTES;
             }
             else
             {
@@ -694,30 +765,7 @@ else #if OS == .MACOS || OS == .LINUX
         coroutine.main_context.r14 = cast(u64)(arguments);                 // The pointer to the coroutine's arguments 
 
         // Setup the initial state of some of the floating point math control registers
-        {
-            mxcsr_pointer                := *coroutine.main_context.MXCSR;
-            x87_fpu_control_word_pointer := *coroutine.main_context.x87_fpu_control_word;
-            #asm
-            {
-                stmxcsr [mxcsr_pointer];
-                // I really wanted to do just: fnstcw [x87_fpu_control_word_pointer];
-                // but we don't have that instruction, so pinning to a register and doing
-                // it with a #bytes:
-                mov r10 : gpr === 10, x87_fpu_control_word_pointer;
-            }
-            #if ASSEMBLE 
-            {
-                #bytes BYTES;
-                #run print_bytes_array(BYTES);
-                BYTES :: #run x64_to_bytes(#string DONE
-                    fnstcw [r10]
-                DONE);
-            }
-            else
-            {
-                #bytes u8.[0x41, 0xd9, 0x3a];
-            }
-        }
+        platform_set_up_floating_point_control_registers(*coroutine.main_context.MXCSR, *coroutine.main_context.x87_fpu_control_word);
     }
 
     platform_deinit :: (coroutine : *Coroutine)
@@ -729,18 +777,12 @@ else #if OS == .MACOS || OS == .LINUX
         }
     }
 
-    platform_switch_context :: no_inline (from : *Coroutine_Context, to : *Coroutine_Context) #c_call
+    platform_switch_context : #type (from : *Coroutine_Context, to : *Coroutine_Context) #c_call = null; 
+    platform_init_switch_context_code :: ()
     {
-        #asm
+        #if ASSEMBLE && false 
         {
-            mov rdi: gpr === di, from;
-            mov rsi: gpr === si, to;
-        }
-        #if ASSEMBLE 
-        {
-            #bytes BYTES;
-            #run print_bytes_array(BYTES);
-            BYTES :: #run x64_to_bytes(#string DONE
+            PLATFORM_SWITCH_CONTEXT_BYTES :: #run x64_to_bytes(#string DONE
                 # Compute the return address, rip+offset points to the instruction after the last jmp of this block
                 lea    rax,[rip+0x4B]
 
@@ -770,29 +812,74 @@ else #if OS == .MACOS || OS == .LINUX
                 # Might as well JMP
                 jmp [rsi]
 
-                # Leaving Jai to do the final ret, because it might need to do stuff
-                # like popping the shadow space it allocated at the beginning, popping rbp, etc. 
+                # And returning at the end, for when we finish and come back here
+                ret
+
+                # Padding with a few interrupts to catch issues
+                int 3
+                int 3
+                int 3
+                int 3
+                int 3
             DONE);
+            #run print_bytes_array(PLATFORM_SWITCH_CONTEXT_BYTES);
         }
         else
         {
-            #bytes u8.[0x48, 0x8d, 0x05, 0x4b, 0x00, 0x00, 0x00, 0x48,
-                       0x89, 0x07, 0x48, 0x89, 0x67, 0x08, 0x48, 0x89,
-                       0x6f, 0x10, 0x48, 0x89, 0x5f, 0x18, 0x4c, 0x89,
-                       0x67, 0x20, 0x4c, 0x89, 0x6f, 0x28, 0x4c, 0x89,
-                       0x77, 0x30, 0x4c, 0x89, 0x7f, 0x38, 0x0f, 0xae,
-                       0x5f, 0x40, 0xd9, 0x7f, 0x44, 0xd9, 0x6e, 0x44,
-                       0x0f, 0xae, 0x56, 0x40, 0x4c, 0x8b, 0x7e, 0x38,
-                       0x4c, 0x8b, 0x76, 0x30, 0x4c, 0x8b, 0x6e, 0x28,
-                       0x4c, 0x8b, 0x66, 0x20, 0x48, 0x8b, 0x5e, 0x18,
-                       0x48, 0x8b, 0x6e, 0x10, 0x48, 0x8b, 0x66, 0x08,
-                       0xff, 0x26, ];
+            PLATFORM_SWITCH_CONTEXT_BYTES :: u8.[
+                0x48, 0x8d, 0x05, 0x4b, 0x00, 0x00, 0x00, 0x48,
+                0x89, 0x07, 0x48, 0x89, 0x67, 0x08, 0x48, 0x89,
+                0x6f, 0x10, 0x48, 0x89, 0x5f, 0x18, 0x4c, 0x89,
+                0x67, 0x20, 0x4c, 0x89, 0x6f, 0x28, 0x4c, 0x89,
+                0x77, 0x30, 0x4c, 0x89, 0x7f, 0x38, 0x0f, 0xae,
+                0x5f, 0x40, 0xd9, 0x7f, 0x44, 0xd9, 0x6e, 0x44,
+                0x0f, 0xae, 0x56, 0x40, 0x4c, 0x8b, 0x7e, 0x38,
+                0x4c, 0x8b, 0x76, 0x30, 0x4c, 0x8b, 0x6e, 0x28,
+                0x4c, 0x8b, 0x66, 0x20, 0x48, 0x8b, 0x5e, 0x18,
+                0x48, 0x8b, 0x6e, 0x10, 0x48, 0x8b, 0x66, 0x08,
+                0xff, 0x26, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+            ];
+        }
+        platform_switch_context = POSIX.mmap(null, PLATFORM_SWITCH_CONTEXT_BYTES.count, POSIX.PROT_READ | POSIX.PROT_WRITE | POSIX.PROT_EXEC, POSIX.MAP_PRIVATE | POSIX.MAP_ANONYMOUS, -1, 0);
+        assert(platform_switch_context != null);
+        memcpy(cast(*void)platform_switch_context, PLATFORM_SWITCH_CONTEXT_BYTES.data, PLATFORM_SWITCH_CONTEXT_BYTES.count);
+        mprotect_make_executable_result := POSIX.mprotect(cast(*void)platform_switch_context, PLATFORM_SWITCH_CONTEXT_BYTES.count, POSIX.PROT_EXEC);
+        assert(mprotect_make_executable_result == 0);
+    }
+
+    platform_set_up_floating_point_control_registers := _platform_set_up_floating_point_control_registers;
+    _platform_set_up_floating_point_control_registers :: no_inline (mxcsr_pointer : *u32, x87_fpu_control_word_pointer : *u16) #c_call
+    {
+        #if ASSEMBLE && false 
+        {
+            BYTES :: #run x64_to_bytes(#string DONE
+                stmxcsr [rdi]
+                fnstcw  [rsi]
+            DONE);
+            #run print_bytes_array(BYTES);
+            #bytes BYTES;
+        }
+        else
+        {
+            #bytes u8.[0x0f, 0xae, 0x1f, 0xd9, 0x3e];
         }
     }
 }
 else
 {
     #assert(false);
+}
+
+
+
+#if CPU == .X64
+{
+    #import "Machine_X64";
+    memory_fences :: () #c_call
+    {
+        mfence();
+        lfence();
+    }
 }
 
 
@@ -804,7 +891,6 @@ else
     #import "File";
     #import "Process";
     #import "executable_formats";
-    #import "Atomics";
 
     counter := 0;
     x64_to_bytes :: (x64_code : string) -> []u8

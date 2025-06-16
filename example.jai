@@ -402,7 +402,7 @@ doing_allocations :: ()
         output.count = buffer.count;
         output.data = alloc(output.count);
         memcpy(output.data, buffer.data, buffer.count);
-        print("We copied it to the output so the user can see it, we did this in the heap: \"%\" (%)", output.*, output.data);
+        print("We copied it to the output so the user can see it, we did this in the heap: \"%\" (%)\n", output.*, output.data);
     }
 
     string_to_shuffle := "Hello sailor!";
