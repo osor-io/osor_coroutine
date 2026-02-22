@@ -16,7 +16,7 @@
 
 
 
-#module_parameters(ASSERT := true, GUARD_PAGES := true, DEFAULT_STACK_SIZE := 64 * 1024, TEMPORARY_STORAGE_SIZE := 4 * 1024, CHECK_STACK_USAGE := false);
+#module_parameters(GUARD_PAGES := true, DEFAULT_STACK_SIZE := 64 * 1024, TEMPORARY_STORAGE_SIZE := 4 * 1024, CHECK_STACK_USAGE := false);
 
 
 
@@ -89,7 +89,7 @@ deinit :: (coroutine : *Coroutine)
 {
     if is_initialized(coroutine)
     {
-        #if ASSERT && CHECK_STACK_USAGE
+        #if Basic.ENABLE_ASSERT && CHECK_STACK_USAGE
         {
             stack_overflow := check_stack_usage(coroutine);
             assert(!stack_overflow, "Potential stack overflow! All the bytes on the stack were modified, which hints that it might have grown above it's allocated size");
@@ -116,12 +116,12 @@ yield :: ()
     switch_context(from = *context.current_coroutine.main_context, to = *context.current_coroutine.back_context);
 }
 
-is_done :: (coroutine : Coroutine) -> bool
+is_done :: (coroutine : *Coroutine) -> bool
 {
     return coroutine.pointer_to_context == null;
 }
 
-is_initialized :: (coroutine : Coroutine) -> bool
+is_initialized :: (coroutine : *Coroutine) -> bool
 {
     return coroutine.procedure != null;
 }
@@ -167,8 +167,7 @@ is_initialized :: (coroutine : Coroutine) -> bool
 
 #import "Compiler";
 #import "Atomics";
-#if ASSERT #import "Basic";
-else assert :: (arg: bool, message := "", args: .. Any, loc := #caller_location) #expand {};
+using Basic :: #import "Basic";
 
 
 
@@ -274,7 +273,7 @@ the_coroutine_code :: no_inline (coroutine : *Coroutine, arguments : *coroutine.
         new_context.stack_trace = *stack_trace_sentinel;
     }
 
-    push_context *new_context
+    push_context new_context
     {
         coroutine.pointer_to_context = *context;
         arguments_copy := arguments.*;
